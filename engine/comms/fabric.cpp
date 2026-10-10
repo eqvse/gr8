@@ -124,9 +124,9 @@ inline uint64_t xt_freq() {
 struct QPInfo { uint32_t qpn, psn, rkey; uint64_t addr; uint8_t gid[16]; };
 struct Rail { DevInfo di; ibv_context* ctx = nullptr; ibv_pd* pd = nullptr; ibv_cq* cq = nullptr; ibv_mr* mr = nullptr; ibv_gid gid{}; };
 
-// ---- switchless ring (G6_RING=1) -------------------------------------------------------------------------------------
+// ---- switchless ring (FabricConfig::ring) ---------------------------------------------------------------------------
 // Ranks sit on a cable ring: port f0 of rank r is cabled to port f1 of rank r+1, and each port shows up as two RDMA
-// devices (one per PCIe root). G6_RING_DEV names this box's four devices, in the order
+// devices (one per PCIe root). FabricConfig::ring_devs names this box's four devices, in the order
 //   relay-out (f0, root 0), direct-next (f0, root 1), relay-in (f1, root 0), direct-prev (f1, root 1).
 // Neighbours are written directly. With four ranks, the diagonal peer (r+2) is reached through the next rank: the
 // payload goes to the next rank's mirror (a region with the same layout, at the same offset) and a SEND tells it where;
@@ -154,11 +154,9 @@ int ring_gid_index(const std::string& dev) {
   }
   return -1;
 }
-std::string boot_ip(const std::string& dflt) { const char* e = getenv("G6_BOOT_IP"); return e && *e ? e : dflt; }
 
 // One relay thread for every ring Fabric of the process: busy-polls each relay-in CQ and forwards in arrival order.
-void relay_loop() {
-  const char* ce = getenv("G6_RELAY_CPU"); const int cpu = ce ? atoi(ce) : 13;
+void relay_loop(int cpu) {
   if (cpu >= 0) {
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cpu, &cs);
     if (pthread_setaffinity_np(pthread_self(), sizeof cs, &cs) == 0) { progress_cpu_add(cpu); progress_tid_add((int)syscall(SYS_gettid)); }
@@ -326,17 +324,16 @@ void Fabric::init(const FabricConfig& cfg) {
   }
   I.xenv = xtrace_env();
 
-  if (const char* re = getenv("G6_RING"); re && atoi(re) > 0) {   // switchless ring (see RelayHdr above)
+  if (cfg.ring) {                                     // switchless ring (see RelayHdr above)
     FCHECK(nr == 3 || nr == 4);
     const int me = cfg.rank;
     I.ring = true; I.nxt = (me + 1) % nr; I.prv = (me + nr - 1) % nr; I.dia = nr == 4 ? (me + 2) % nr : -1;
     I.ring_rail[I.nxt] = 0; I.ring_rail[I.prv] = 1; if (I.dia >= 0) I.ring_rail[I.dia] = 2;
     I.nrails = nr == 4 ? 3 : 2;                         // the rails whose CQs the proxy polls
-    std::vector<std::string> dn;
-    { const char* de = getenv("G6_RING_DEV"); std::string v = de && *de ? de : "rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1";
-      size_t a = 0; for (;;) { size_t b = v.find(',', a); dn.push_back(v.substr(a, b == std::string::npos ? b : b - a)); if (b == std::string::npos) break; a = b + 1; } }
+    const std::vector<std::string> dn = cfg.ring_devs.empty()
+        ? std::vector<std::string>{"rocep1s0f0", "roceP2p1s0f0", "rocep1s0f1", "roceP2p1s0f1"} : cfg.ring_devs;
     FCHECK(dn.size() == 4);
-    const int map[4] = {2, 0, 3, 1};                    // G6_RING_DEV order -> rails index
+    const int map[4] = {2, 0, 3, 1};                    // ring_devs order -> rails index
     const int nopen = nr == 4 ? 4 : 2;
     for (int k = 0; k < 4; k++) {
       const int r = map[k]; if (r >= nopen) continue;
@@ -410,7 +407,7 @@ void Fabric::init(const FabricConfig& cfg) {
       mi.fin = info(qfin, I.rails[3], I.rails[3].mr->rkey, recv, 6);
       fprintf(stderr, "[fabric r%d] ring: diagonal %d through %d, mirror %.1f MB\n", me, I.dia, I.nxt, mb / 1048576.0);
     }
-    auto all = allgather(me, nr, boot_ip(cfg.ips[0]), cfg.port, &mi, sizeof mi);
+    auto all = allgather(me, nr, cfg.ips[0], cfg.port, &mi, sizeof mi);
     const RingInfo* A = (const RingInfo*)all.data();
     connect(qdn, I.rails[0], mi.dn, A[I.nxt].dp); I.qp[I.nxt] = qdn; I.peer[I.nxt] = A[I.nxt].dp;
     connect(qdp, I.rails[1], mi.dp, A[I.prv].dn); I.qp[I.prv] = qdp; I.peer[I.prv] = A[I.prv].dn;
@@ -424,7 +421,7 @@ void Fabric::init(const FabricConfig& cfg) {
       std::lock_guard<std::mutex> lk(g_relay_mu);
       const int k = g_nrelay.load(); FCHECK(k < 32);
       g_relay[k] = &X; g_nrelay.store(k + 1, std::memory_order_release);
-      if (!g_relay_started) { g_relay_started = true; std::thread(relay_loop).detach(); }
+      if (!g_relay_started) { g_relay_started = true; std::thread(relay_loop, cfg.relay_cpu).detach(); }
     }
     barrier();
     return;
@@ -454,7 +451,7 @@ void Fabric::init(const FabricConfig& cfg) {
     mine[p] = QPInfo{I.qp[p]->qp_num, (uint32_t)((cfg.rank * 131 + p * 7) & 0xffffff), R.mr->rkey, (uint64_t)dev_.recv, {}};
     memcpy(mine[p].gid, R.gid.raw, 16);
   }
-  auto all = allgather(cfg.rank, nr, boot_ip(cfg.ips[0]), cfg.port, mine.data(), sizeof(QPInfo) * nr);
+  auto all = allgather(cfg.rank, nr, cfg.ips[0], cfg.port, mine.data(), sizeof(QPInfo) * nr);
   I.peer.resize(nr);
   for (int p = 0; p < nr; p++) {
     if (p == cfg.rank) continue;
@@ -473,7 +470,7 @@ void Fabric::init(const FabricConfig& cfg) {
 
 void Fabric::barrier() {
   static int bump = 1;
-  char z = 0; allgather(cfg_.rank, nranks(), boot_ip(cfg_.ips[0]), cfg_.port + (bump++ % 3) + 1, &z, 1);
+  char z = 0; allgather(cfg_.rank, nranks(), cfg_.ips[0], cfg_.port + (bump++ % 3) + 1, &z, 1);
 }
 
 void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes) { enqueue_step(step, sizes, Rs{}); }
