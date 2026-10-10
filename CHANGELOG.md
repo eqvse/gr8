@@ -4,9 +4,11 @@
 
 - Each box's f0 port is cabled to the f1 port of the next box in `--peers` order. Every port shows up as two RDMA
   devices, one per PCIe root. Neighbours are written directly on their own devices. At TP=4 the diagonal is reached
-  through the next rank: the origin writes the payload into a mirror of the destination's region on that rank and
-  sends its offset, and a relay thread there forwards the same bytes to the same offset. Writes of 48 bytes or less
-  (the bulk flags) travel inside the SEND. The mirror costs about 5 GB of pinned memory per rank at TP=4.
+  through the next rank: the origin writes the payload into a 32 MB relay ring on that rank and sends its ring position
+  and destination offset, and a relay thread there forwards the same bytes to the same offset, then returns a credit.
+  Writes of 40 bytes or less (the bulk flags) travel inside the SEND. The rings pin about 0.25 GB per rank at TP=4
+  (the first version mirrored each fabric's receive side, 5.2 GB per rank, which left too little memory for the
+  default CAP).
 - The launcher passes `--ring` and the LAN addresses as `--ips`: the fabric and S2 bootstraps go over the LAN.
   `--ring-devs` names the four devices when they differ from the GB10 defaults. The relay thread takes the core 8
   below `--proxy-cpu` (11 by default), below the seven other proxies.
